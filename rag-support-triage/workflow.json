@@ -1,0 +1,813 @@
+{
+  "name": "RAG Support Triage",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## RAG Support Triage\n\nInbound support tickets arrive by webhook, get classified by an LLM, enriched with grounded context from a self-hosted RAG service, and either auto-resolved (high confidence) or routed to a human. High-urgency tickets are paged regardless of confidence.\n\n**Path:** Webhook -> Normalize -> Classify -> Urgency Switch -> Retrieve KB -> Draft Reply -> Confidence Score -> Auto-send OR Human Review -> Audit -> Respond.\n\nNo secrets are stored in this export. All keys/URLs are injected via n8n credentials and environment variables (see README).",
+        "height": 320,
+        "width": 420,
+        "color": 4
+      },
+      "id": "node-0001",
+      "name": "Note Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, -340]
+    },
+    {
+      "parameters": {
+        "content": "### Confidence model\n\nFinal score is a weighted blend, computed in **Score Confidence**:\n\n- `retrieval` (RAG /ask confidence) x 0.45\n- `self_confidence` (LLM draft self-rating) x 0.35\n- `classification_certainty` (urgency/intent agreement) x 0.20\n\nThresholds:\n- score >= 0.78 AND urgency != critical -> auto-send\n- otherwise -> human review task\n- critical OR high urgency -> page on-call in addition\n\nFloors: retrieval < 0.35 is treated as a KB miss and forces human review.",
+        "height": 360,
+        "width": 420,
+        "color": 5
+      },
+      "id": "node-0002",
+      "name": "Note Confidence Model",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [2840, -360]
+    },
+    {
+      "parameters": {
+        "content": "### RAG service tie-in\n\n**Retrieve KB (RAG)** calls a self-hosted FastAPI RAG service:\n\n`POST {{$env.RAG_SERVICE_URL}}/ask`\nbody: `{ question, top_k }`\nreturns: `{ answer, sources, confidence }`\n\nThis pairs with the companion repo:\n**github.com/ammar9691/rag-qa**\n\nwhich exposes exactly this `/ask` endpoint over an embedded vector store. The retrieval node uses an error output so an unreachable RAG service degrades gracefully to human review instead of failing the run.",
+        "height": 340,
+        "width": 420,
+        "color": 6
+      },
+      "id": "node-0003",
+      "name": "Note RAG Tie-in",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1420, -380]
+    },
+    {
+      "parameters": {
+        "content": "### Setup\n\n1. Set env vars: `RAG_SERVICE_URL`, `HELPDESK_API_URL`, `SLACK_WEBHOOK_URL`, `PAGER_WEBHOOK_URL`, `AUDIT_SINK_URL`.\n2. Create credentials:\n   - `OpenAI key` (HTTP Header Auth, `Authorization: Bearer ...`)\n   - `Helpdesk API` (HTTP Header Auth)\n   - `Audit sink` (HTTP Header Auth, optional)\n3. Map them onto the matching HTTP Request nodes.\n4. Webhook path: `POST /support-triage`.\n\nIdempotency: every downstream call carries `ticket_id`; the helpdesk send and tag should be keyed on it so retries do not double-send.",
+        "height": 340,
+        "width": 420,
+        "color": 3
+      },
+      "id": "node-0004",
+      "name": "Note Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-200, 20]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "support-triage",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-0005",
+      "name": "Inbound Ticket",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [280, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "ticket_id",
+              "value": "={{ $json.body.ticket_id }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "from",
+              "value": "={{ $json.body.from }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "subject",
+              "value": "={{ ($json.body.subject || '').trim() }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "body",
+              "value": "={{ ($json.body.body || '').trim() }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "channel",
+              "value": "={{ $json.body.channel || 'email' }}",
+              "type": "string"
+            },
+            {
+              "id": "a6",
+              "name": "received_at",
+              "value": "={{ $now.toISO() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-0006",
+      "name": "Normalize Ticket",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [560, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o\",\n  \"temperature\": 0,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a support triage classifier. Return strict JSON with keys: intent (string), category (string), urgency (one of: low, normal, high, critical), sentiment (one of: negative, neutral, positive), language (ISO 639-1 code), certainty (number 0..1 for your own confidence in this classification). No prose.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": {{ JSON.stringify('Channel: ' + $json.channel + '\\nSubject: ' + $json.subject + '\\n\\n' + $json.body) }}\n    }\n  ]\n}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        }
+      },
+      "id": "node-0007",
+      "name": "Classify (LLM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [840, 300],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "OpenAI key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the LLM classification, validate fields, and carry the normalized ticket forward.\nconst ticket = $items('Normalize Ticket')[0].json;\nconst resp = $input.first().json;\n\nlet parsed = {};\ntry {\n  const raw = resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;\n  parsed = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});\n} catch (e) {\n  parsed = {};\n}\n\nconst allowedUrgency = ['low', 'normal', 'high', 'critical'];\nconst urgency = allowedUrgency.includes(parsed.urgency) ? parsed.urgency : 'normal';\nconst certainty = typeof parsed.certainty === 'number'\n  ? Math.max(0, Math.min(1, parsed.certainty))\n  : 0.5;\n\nreturn [{\n  json: {\n    ...ticket,\n    classification: {\n      intent: parsed.intent || 'unknown',\n      category: parsed.category || 'general',\n      urgency,\n      sentiment: parsed.sentiment || 'neutral',\n      language: parsed.language || 'en',\n      certainty\n    }\n  }\n}];"
+      },
+      "id": "node-0008",
+      "name": "Parse Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.classification.urgency }}",
+                    "rightValue": "critical",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "escalation"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.classification.urgency }}",
+                    "rightValue": "high",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "escalation"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.classification.urgency }}",
+                    "rightValue": "normal",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "standard"
+            }
+          ]
+        },
+        "fallbackOutput": "extra",
+        "options": {}
+      },
+      "id": "node-0009",
+      "name": "Urgency Switch",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1400, 300]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "id": "node-0010",
+      "name": "Merge Paths",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1680, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e1",
+              "name": "classification.escalate",
+              "value": "={{ ['critical','high'].includes($json.classification.urgency) }}",
+              "type": "boolean"
+            }
+          ]
+        },
+        "include": "all",
+        "options": {}
+      },
+      "id": "node-0011",
+      "name": "Flag Escalation",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [1960, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.RAG_SERVICE_URL }}/ask",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"question\": {{ JSON.stringify($json.subject + '\\n\\n' + $json.body) }},\n  \"top_k\": 5\n}",
+        "options": {}
+      },
+      "id": "node-0012",
+      "name": "Retrieve KB (RAG)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2240, 300],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize RAG response and attach a retrieval confidence floor.\n// Works whether we arrive on the success output or the error output.\nconst item = $input.first().json;\nconst ticket = $items('Flag Escalation')[0].json;\n\nconst rag = (item && typeof item === 'object' && (item.answer !== undefined || item.sources !== undefined))\n  ? item\n  : {};\n\nconst sources = Array.isArray(rag.sources) ? rag.sources : [];\nconst retrieval = typeof rag.confidence === 'number'\n  ? Math.max(0, Math.min(1, rag.confidence))\n  : 0;\nconst hasAnswer = typeof rag.answer === 'string' && rag.answer.trim().length > 0;\nconst kbHit = hasAnswer && sources.length > 0 && retrieval >= 0.35;\n\nreturn [{\n  json: {\n    ...ticket,\n    rag: {\n      answer: hasAnswer ? rag.answer : '',\n      sources,\n      retrieval,\n      kb_hit: kbHit\n    }\n  }\n}];"
+      },
+      "id": "node-0013",
+      "name": "Normalize RAG",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2520, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.rag.kb_hit }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-0014",
+      "name": "KB hit?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2800, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o\",\n  \"temperature\": 0.2,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a support agent. Draft a concise, grounded reply using ONLY the provided knowledge-base context. If the context does not cover the question, say so and lower self_confidence. Return strict JSON: reply (string), used_sources (array of strings), self_confidence (number 0..1). No prose outside JSON.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": {{ JSON.stringify('Customer ticket:\\n' + $json.subject + '\\n\\n' + $json.body + '\\n\\nKnowledge-base answer:\\n' + $json.rag.answer + '\\n\\nSources: ' + JSON.stringify($json.rag.sources)) }}\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "node-0015",
+      "name": "Draft Reply (LLM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3080, 200],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "OpenAI key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "m1",
+              "name": "draft.reply",
+              "value": "=We have received your request and a support specialist will follow up shortly with the details you need.",
+              "type": "string"
+            },
+            {
+              "id": "m2",
+              "name": "draft.used_sources",
+              "value": "={{ [] }}",
+              "type": "array"
+            },
+            {
+              "id": "m3",
+              "name": "draft.self_confidence",
+              "value": "={{ 0 }}",
+              "type": "number"
+            },
+            {
+              "id": "m4",
+              "name": "draft.raw",
+              "value": "=true",
+              "type": "boolean"
+            }
+          ]
+        },
+        "include": "all",
+        "options": {}
+      },
+      "id": "node-0016",
+      "name": "KB Miss Fallback",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [3080, 420]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Attach the parsed draft from the LLM response onto the ticket.\nconst ticket = $items('Normalize RAG')[0].json;\nconst resp = $input.first().json;\n\nlet parsed = {};\ntry {\n  const raw = resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;\n  parsed = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});\n} catch (e) {\n  parsed = {};\n}\n\nconst self_confidence = typeof parsed.self_confidence === 'number'\n  ? Math.max(0, Math.min(1, parsed.self_confidence))\n  : 0;\n\nreturn [{\n  json: {\n    ...ticket,\n    draft: {\n      reply: parsed.reply || '',\n      used_sources: Array.isArray(parsed.used_sources) ? parsed.used_sources : [],\n      self_confidence,\n      raw: false\n    }\n  }\n}];"
+      },
+      "id": "node-0017",
+      "name": "Parse Draft",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3360, 200]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "numberInputs": 2,
+        "options": {}
+      },
+      "id": "node-0018",
+      "name": "Merge Draft",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [3640, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Combine retrieval confidence, model self-confidence, and classification\n// certainty into a single 0..1 score and decide the action.\nconst t = $input.first().json;\n\nconst retrieval = (t.rag && typeof t.rag.retrieval === 'number') ? t.rag.retrieval : 0;\nconst self_conf = (t.draft && typeof t.draft.self_confidence === 'number') ? t.draft.self_confidence : 0;\nconst certainty = (t.classification && typeof t.classification.certainty === 'number') ? t.classification.certainty : 0.5;\nconst urgency = (t.classification && t.classification.urgency) || 'normal';\nconst escalate = !!(t.classification && t.classification.escalate);\nconst kbHit = !!(t.rag && t.rag.kb_hit);\n\n// Weighted blend.\nconst score = Number((\n  retrieval * 0.45 +\n  self_conf * 0.35 +\n  certainty * 0.20\n).toFixed(4));\n\n// Decision logic.\nconst autoSendEligible = kbHit && score >= 0.78 && urgency !== 'critical';\nlet action;\nif (autoSendEligible) {\n  action = 'auto_send';\n} else {\n  action = 'human_review';\n}\n\nreturn [{\n  json: {\n    ...t,\n    decision: {\n      score,\n      components: { retrieval, self_confidence: self_conf, certainty },\n      action,\n      escalate,\n      reason: autoSendEligible\n        ? 'High blended confidence, non-critical urgency'\n        : (!kbHit ? 'No grounded KB match' : (urgency === 'critical' ? 'Critical urgency requires human' : 'Confidence below auto-send threshold'))\n    }\n  }\n}];"
+      },
+      "id": "node-0019",
+      "name": "Score Confidence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3920, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "as1",
+              "leftValue": "={{ $json.decision.action }}",
+              "rightValue": "auto_send",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-0020",
+      "name": "Auto-send threshold",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [4200, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.HELPDESK_API_URL }}/tickets/{{ $json.ticket_id }}/reply",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Idempotency-Key",
+              "value": "=reply-{{ $json.ticket_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"to\": {{ JSON.stringify($json.from) }},\n  \"subject\": {{ JSON.stringify('Re: ' + $json.subject) }},\n  \"body\": {{ JSON.stringify($json.draft.reply) }},\n  \"channel\": {{ JSON.stringify($json.channel) }}\n}",
+        "options": {}
+      },
+      "id": "node-0021",
+      "name": "Send Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [4480, 180],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "Helpdesk API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.HELPDESK_API_URL }}/tickets/{{ $json.ticket_id }}/tags",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Idempotency-Key",
+              "value": "=tag-{{ $json.ticket_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"tags\": [\"auto-resolved\", \"rag-triage\"],\n  \"status\": \"resolved\"\n}",
+        "options": {}
+      },
+      "id": "node-0022",
+      "name": "Tag Ticket Resolved",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [4760, 180],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "Helpdesk API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"text\": {{ JSON.stringify(':inbox_tray: Review needed for ticket ' + $json.ticket_id + ' (' + $json.classification.urgency + ', score ' + $json.decision.score + ')\\n*Subject:* ' + $json.subject + '\\n*Reason:* ' + $json.decision.reason + '\\n*Draft reply:*\\n' + ($json.draft.reply || '(none generated)')) }}\n}",
+        "options": {}
+      },
+      "id": "node-0023",
+      "name": "Create Review Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [4480, 420],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "esc1",
+              "leftValue": "={{ $json.decision.escalate }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-0024",
+      "name": "Needs paging?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [4480, 620]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.PAGER_WEBHOOK_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"summary\": {{ JSON.stringify('Urgent support ticket ' + $json.ticket_id + ' (' + $json.classification.urgency + ')') }},\n  \"severity\": {{ JSON.stringify($json.classification.urgency === 'critical' ? 'critical' : 'warning') }},\n  \"source\": \"rag-support-triage\",\n  \"dedup_key\": {{ JSON.stringify('ticket-' + $json.ticket_id) }},\n  \"details\": {{ JSON.stringify($json.subject + '\\n\\n' + $json.body) }}\n}",
+        "options": {}
+      },
+      "id": "node-0025",
+      "name": "Page On-call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [4760, 620],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {},
+      "id": "node-0026",
+      "name": "No Page",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [4760, 760]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a single audit record summarizing the decision for this ticket.\nconst t = $items('Score Confidence')[0].json;\n\nreturn [{\n  json: {\n    audit: {\n      ticket_id: t.ticket_id,\n      received_at: t.received_at,\n      logged_at: new Date().toISOString(),\n      from: t.from,\n      channel: t.channel,\n      classification: t.classification,\n      retrieval_confidence: t.rag ? t.rag.retrieval : 0,\n      kb_hit: t.rag ? t.rag.kb_hit : false,\n      used_sources: t.draft ? t.draft.used_sources : [],\n      score: t.decision.score,\n      action_taken: t.decision.action,\n      escalated: t.decision.escalate,\n      reason: t.decision.reason\n    }\n  }\n}];"
+      },
+      "id": "node-0027",
+      "name": "Build Audit Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [5040, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AUDIT_SINK_URL }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.audit) }}",
+        "options": {}
+      },
+      "id": "node-0028",
+      "name": "Append Audit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [5320, 300],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "Audit sink"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"status\": \"ok\",\n  \"ticket_id\": {{ JSON.stringify($json.audit.ticket_id) }},\n  \"action_taken\": {{ JSON.stringify($json.audit.action_taken) }},\n  \"confidence\": {{ $json.audit.score }},\n  \"escalated\": {{ $json.audit.escalated }}\n}",
+        "options": {}
+      },
+      "id": "node-0029",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [5600, 300]
+    }
+  ],
+  "connections": {
+    "Inbound Ticket": {
+      "main": [[{ "node": "Normalize Ticket", "type": "main", "index": 0 }]]
+    },
+    "Normalize Ticket": {
+      "main": [[{ "node": "Classify (LLM)", "type": "main", "index": 0 }]]
+    },
+    "Classify (LLM)": {
+      "main": [[{ "node": "Parse Classification", "type": "main", "index": 0 }]]
+    },
+    "Parse Classification": {
+      "main": [[{ "node": "Urgency Switch", "type": "main", "index": 0 }]]
+    },
+    "Urgency Switch": {
+      "main": [
+        [{ "node": "Merge Paths", "type": "main", "index": 0 }],
+        [{ "node": "Merge Paths", "type": "main", "index": 1 }],
+        [{ "node": "Merge Paths", "type": "main", "index": 0 }],
+        [{ "node": "Merge Paths", "type": "main", "index": 0 }]
+      ]
+    },
+    "Merge Paths": {
+      "main": [[{ "node": "Flag Escalation", "type": "main", "index": 0 }]]
+    },
+    "Flag Escalation": {
+      "main": [[{ "node": "Retrieve KB (RAG)", "type": "main", "index": 0 }]]
+    },
+    "Retrieve KB (RAG)": {
+      "main": [
+        [{ "node": "Normalize RAG", "type": "main", "index": 0 }],
+        [{ "node": "Normalize RAG", "type": "main", "index": 0 }]
+      ]
+    },
+    "Normalize RAG": {
+      "main": [[{ "node": "KB hit?", "type": "main", "index": 0 }]]
+    },
+    "KB hit?": {
+      "main": [
+        [{ "node": "Draft Reply (LLM)", "type": "main", "index": 0 }],
+        [{ "node": "KB Miss Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "Draft Reply (LLM)": {
+      "main": [[{ "node": "Parse Draft", "type": "main", "index": 0 }]]
+    },
+    "Parse Draft": {
+      "main": [[{ "node": "Merge Draft", "type": "main", "index": 0 }]]
+    },
+    "KB Miss Fallback": {
+      "main": [[{ "node": "Merge Draft", "type": "main", "index": 1 }]]
+    },
+    "Merge Draft": {
+      "main": [[{ "node": "Score Confidence", "type": "main", "index": 0 }]]
+    },
+    "Score Confidence": {
+      "main": [[{ "node": "Auto-send threshold", "type": "main", "index": 0 }]]
+    },
+    "Auto-send threshold": {
+      "main": [
+        [{ "node": "Send Reply", "type": "main", "index": 0 }],
+        [{ "node": "Create Review Task", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Reply": {
+      "main": [[{ "node": "Tag Ticket Resolved", "type": "main", "index": 0 }]]
+    },
+    "Tag Ticket Resolved": {
+      "main": [[{ "node": "Build Audit Log", "type": "main", "index": 0 }]]
+    },
+    "Create Review Task": {
+      "main": [[{ "node": "Needs paging?", "type": "main", "index": 0 }]]
+    },
+    "Needs paging?": {
+      "main": [
+        [{ "node": "Page On-call", "type": "main", "index": 0 }],
+        [{ "node": "No Page", "type": "main", "index": 0 }]
+      ]
+    },
+    "Page On-call": {
+      "main": [[{ "node": "Build Audit Log", "type": "main", "index": 0 }]]
+    },
+    "No Page": {
+      "main": [[{ "node": "Build Audit Log", "type": "main", "index": 0 }]]
+    },
+    "Build Audit Log": {
+      "main": [[{ "node": "Append Audit", "type": "main", "index": 0 }]]
+    },
+    "Append Audit": {
+      "main": [[{ "node": "Respond", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {},
+  "meta": { "templateId": null },
+  "tags": []
+}

@@ -1,0 +1,869 @@
+{
+  "name": "SEO Blog Content Engine",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SEO Blog Content Engine\n\n**Purpose:** On a weekday schedule, pull the next queued keyword from the editorial backlog, research the SERP, generate an SEO outline then a full draft, run automated SEO quality checks, and publish PASSING drafts to WordPress as **draft** for human review. Failing drafts are flagged in Slack and marked `needs_review`.\n\nNothing is ever auto-published live. A human always approves in WordPress before going public.\n\nFlow: Schedule -> Fetch Queue -> Pick Topic -> SERP Research -> Brief -> Outline (LLM, self-validated) -> Draft (LLM) -> SEO Checks -> WordPress draft OR Slack flag -> Run log.",
+        "height": 360,
+        "width": 460,
+        "color": 4
+      },
+      "id": "node-0001",
+      "name": "Sticky: Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-560, -120]
+    },
+    {
+      "parameters": {
+        "content": "### Quality-gate logic\n\n**Outline validation** (Code) checks required fields, meta length 120-158 chars, and at least 4 H2 sections. If invalid it loops back to **Generate Outline** ONCE using `outline_attempt` counter on the item, then gives up and flags for human.\n\n**SEO Quality Checks** scores the finished draft. Only a `pass` reaches WordPress. A `fail` is routed to Slack with the concrete `issues[]` list and the queue row is marked `needs_review`.",
+        "height": 300,
+        "width": 420,
+        "color": 5
+      },
+      "id": "node-0002",
+      "name": "Sticky: Quality Gate",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1760, -160]
+    },
+    {
+      "parameters": {
+        "content": "### SEO checks explained\n\n- **Word count** vs target (from research brief).\n- **Primary keyword density** flagged if < 0.5% or > 2.5% (keyword stuffing / under-optimisation).\n- **Meta description** length 120-158 chars.\n- **Structure:** at least one H2 and one H3 present.\n- **Internal links:** at least 1 suggested link rendered.\n- **Readability proxy:** average sentence length under ~25 words.\n\nEach failed check adds to `issues[]` and lowers the score. `pass = score >= 80 and no critical issue`.",
+        "height": 340,
+        "width": 420,
+        "color": 6
+      },
+      "id": "node-0003",
+      "name": "Sticky: SEO Checks",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [2240, -160]
+    },
+    {
+      "parameters": {
+        "content": "### Setup: SERP + WordPress + LLM\n\n**Credentials**\n- `httpHeaderAuth` (queue API): backlog source (Airtable/Sheet/CMS).\n- `httpQueryAuth` or header (SerpApi): SERP research.\n- `openAiApi` style header auth on the OpenAI HTTP nodes.\n- `wordpressApi`: WordPress REST publish (Application Password).\n- `slackApi` / incoming webhook header for notifications.\n\n**Env vars**\n`CONTENT_QUEUE_URL`, `SERP_API_URL`, `WORDPRESS_BASE_URL`, `SLACK_WEBHOOK_URL`, `RUN_LOG_URL`.\n\nSee README for the full table.",
+        "height": 360,
+        "width": 440,
+        "color": 3
+      },
+      "id": "node-0004",
+      "name": "Sticky: Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-560, 280]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "node-0005",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-60, 60]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{$env.CONTENT_QUEUE_URL}}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "status",
+              "value": "pending"
+            },
+            {
+              "name": "sort",
+              "value": "priority"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node-0006",
+      "name": "Fetch Content Queue",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 60],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "PLACEHOLDER_QUEUE",
+          "name": "Content Queue API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalise the queue payload (Airtable/Sheet/CMS all differ) and pick the\n// highest-priority pending item. Lower priority number = more urgent.\nconst body = $input.first().json || {};\nlet rows = body.records || body.items || body.data || body.rows || [];\nif (!Array.isArray(rows)) rows = [];\n\nconst pending = rows\n  .map((r) => {\n    const f = r.fields || r;\n    return {\n      queue_id: r.id || f.id || f.queue_id,\n      target_keyword: (f.target_keyword || f.keyword || '').trim(),\n      priority: Number(f.priority ?? 999),\n      status: (f.status || 'pending').toLowerCase(),\n      notes: f.notes || ''\n    };\n  })\n  .filter((r) => r.status === 'pending' && r.target_keyword);\n\npending.sort((a, b) => a.priority - b.priority);\n\nif (pending.length === 0) {\n  return [{ json: { has_topic: false } }];\n}\n\nconst chosen = pending[0];\nreturn [\n  {\n    json: {\n      has_topic: true,\n      queue_id: chosen.queue_id,\n      target_keyword: chosen.target_keyword,\n      priority: chosen.priority,\n      notes: chosen.notes,\n      outline_attempt: 0,\n      run_started_at: new Date().toISOString()\n    }\n  }\n];"
+      },
+      "id": "node-0007",
+      "name": "Pick Next Topic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 60]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-hastopic",
+              "leftValue": "={{ $json.has_topic }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-0008",
+      "name": "Has topic?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [780, 60]
+    },
+    {
+      "parameters": {},
+      "id": "node-0009",
+      "name": "Nothing queued",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1060, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{$env.SERP_API_URL}}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "engine",
+              "value": "google"
+            },
+            {
+              "name": "q",
+              "value": "={{ $json.target_keyword }}"
+            },
+            {
+              "name": "num",
+              "value": "10"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "node-0010",
+      "name": "SERP Research",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1060, 60],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": {
+        "httpQueryAuth": {
+          "id": "PLACEHOLDER_SERP",
+          "name": "SerpApi"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a research brief from the SERP payload. Handle an empty / errored\n// SERP gracefully so the pipeline still produces a sensible outline.\nconst topic = $('Pick Next Topic').first().json;\nconst serp = $input.first().json || {};\n\nconst organic = serp.organic_results || [];\nconst paa = serp.related_questions || serp.people_also_ask || [];\n\n// Pull competitor headings where the SERP API exposes them.\nconst competitorHeadings = [];\nfor (const r of organic.slice(0, 10)) {\n  if (Array.isArray(r.headings)) competitorHeadings.push(...r.headings);\n  if (r.title) competitorHeadings.push(r.title);\n}\n\nconst paaQuestions = paa\n  .map((q) => (typeof q === 'string' ? q : q.question))\n  .filter(Boolean)\n  .slice(0, 8);\n\n// Crude subtopic frequency from titles/snippets.\nconst text = organic\n  .map((r) => `${r.title || ''} ${r.snippet || ''}`)\n  .join(' ')\n  .toLowerCase();\nconst stop = new Set(['the','and','for','with','that','this','your','you','are','how','what','best','from','their']);\nconst freq = {};\nfor (const w of text.match(/[a-z]{4,}/g) || []) {\n  if (stop.has(w)) continue;\n  freq[w] = (freq[w] || 0) + 1;\n}\nconst commonSubtopics = Object.entries(freq)\n  .sort((a, b) => b[1] - a[1])\n  .slice(0, 12)\n  .map(([w]) => w);\n\n// Target word count: lean on top competitor length signals, default 1500.\nconst lengths = organic.map((r) => Number(r.word_count || 0)).filter(Boolean);\nconst avgLen = lengths.length ? lengths.reduce((a, b) => a + b, 0) / lengths.length : 0;\nconst targetWordCount = Math.min(2600, Math.max(1200, Math.round((avgLen || 1500) / 100) * 100 || 1500));\n\nconst serpEmpty = organic.length === 0;\n\nreturn [\n  {\n    json: {\n      ...topic,\n      brief: {\n        competitor_headings: competitorHeadings.slice(0, 25),\n        paa_questions: paaQuestions,\n        common_subtopics: commonSubtopics,\n        target_word_count: targetWordCount,\n        serp_empty: serpEmpty\n      }\n    }\n  }\n];"
+      },
+      "id": "node-0011",
+      "name": "Build Research Brief",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1340, 60]
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineAll",
+        "options": {}
+      },
+      "id": "node-0012",
+      "name": "Merge SERP Paths",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1340, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o\",\n  \"temperature\": 0.4,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a senior SEO content strategist. Return ONLY valid JSON matching the requested schema. Meta description must be 120-158 characters. Provide at least 4 H2 sections, each with 1-3 H3 subheadings.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": {{ JSON.stringify('Target keyword: ' + $json.target_keyword + '\\nTarget word count: ' + $json.brief.target_word_count + '\\nPeople Also Ask: ' + JSON.stringify($json.brief.paa_questions) + '\\nCompetitor headings: ' + JSON.stringify($json.brief.competitor_headings) + '\\nCommon subtopics: ' + JSON.stringify($json.brief.common_subtopics) + '\\n\\nProduce JSON with keys: title, slug, meta_description, target_keyword, secondary_keywords (array), h2_sections (array of {h2, h3 (array)}), internal_link_suggestions (array of {anchor, topic}).') }}\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "node-0013",
+      "name": "Generate Outline (LLM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1620, 280],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "PLACEHOLDER_OPENAI",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the LLM outline and validate it. Loop back to regenerate ONCE if invalid.\nconst item = $('Build Research Brief').first().json;\nconst attempt = Number(item.outline_attempt || 0);\n\nlet outline = {};\ntry {\n  const raw = $input.first().json;\n  const content = raw.choices?.[0]?.message?.content || '{}';\n  outline = JSON.parse(content);\n} catch (e) {\n  outline = {};\n}\n\nconst issues = [];\nconst meta = (outline.meta_description || '').trim();\nif (!outline.title) issues.push('missing title');\nif (!outline.slug) issues.push('missing slug');\nif (!outline.target_keyword) outline.target_keyword = item.target_keyword;\nif (meta.length < 120 || meta.length > 158) issues.push(`meta length ${meta.length} not in 120-158`);\nconst h2 = Array.isArray(outline.h2_sections) ? outline.h2_sections : [];\nif (h2.length < 4) issues.push(`only ${h2.length} H2 sections (need 4+)`);\n\nconst valid = issues.length === 0;\n\nreturn [\n  {\n    json: {\n      ...item,\n      outline,\n      outline_valid: valid,\n      outline_issues: issues,\n      outline_attempt: attempt + 1,\n      can_retry_outline: !valid && attempt < 1\n    }\n  }\n];"
+      },
+      "id": "node-0014",
+      "name": "Validate Outline",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1900, 280]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "rule-valid",
+                    "leftValue": "={{ $json.outline_valid }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "valid"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "rule-retry",
+                    "leftValue": "={{ $json.can_retry_outline }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "true",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "retry"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "giveup"
+        }
+      },
+      "id": "node-0015",
+      "name": "Outline OK?",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [2180, 280]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"gpt-4o\",\n  \"temperature\": 0.6,\n  \"response_format\": { \"type\": \"json_object\" },\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a senior long-form SEO writer. Follow the supplied outline exactly. Use the primary keyword in the title, the first paragraph, and at least one H2. Output clean semantic HTML (h2/h3/p/ul/a). Return JSON: { html_body, word_count, internal_links_rendered }.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": {{ JSON.stringify('Primary keyword: ' + $json.target_keyword + '\\nTarget word count: ' + $json.brief.target_word_count + '\\nOutline JSON: ' + JSON.stringify($json.outline) + '\\n\\nWrite the full article body as HTML following every H2/H3. Render the internal_link_suggestions as <a> placeholders. Return the JSON described in the system prompt.') }}\n    }\n  ]\n}",
+        "options": {}
+      },
+      "id": "node-0016",
+      "name": "Write Draft (LLM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2460, 200],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "PLACEHOLDER_OPENAI",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compute SEO quality metrics on the finished draft and produce pass/fail + score.\nconst item = $('Validate Outline').first().json;\nlet draft = {};\ntry {\n  const content = $input.first().json.choices?.[0]?.message?.content || '{}';\n  draft = JSON.parse(content);\n} catch (e) {\n  draft = {};\n}\n\nconst html = draft.html_body || '';\nconst text = html.replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim();\nconst words = text ? text.split(' ') : [];\nconst wordCount = words.length;\n\nconst keyword = (item.target_keyword || '').toLowerCase();\nconst kwTokens = keyword.split(/\\s+/).filter(Boolean).length || 1;\nlet kwHits = 0;\nif (keyword) {\n  const re = new RegExp(keyword.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&'), 'gi');\n  kwHits = (text.match(re) || []).length;\n}\nconst density = wordCount ? (kwHits * kwTokens / wordCount) * 100 : 0;\n\nconst meta = (item.outline?.meta_description || '').trim();\nconst hasH2 = /<h2[ >]/i.test(html);\nconst hasH3 = /<h3[ >]/i.test(html);\nconst internalLinks = (html.match(/<a [^>]*href/gi) || []).length;\n\n// Readability proxy: average sentence length.\nconst sentences = text.split(/[.!?]+\\s/).filter((s) => s.trim().length > 0);\nconst avgSentence = sentences.length ? wordCount / sentences.length : wordCount;\n\nconst keywordInTitle = (item.outline?.title || '').toLowerCase().includes(keyword);\nconst firstPara = (html.match(/<p[^>]*>(.*?)<\\/p>/i)?.[1] || '').toLowerCase();\nconst keywordInIntro = firstPara.includes(keyword);\n\nconst target = item.brief?.target_word_count || 1500;\nconst issues = [];\nlet score = 100;\nlet critical = false;\n\nif (wordCount < target * 0.7) { issues.push(`word count ${wordCount} below target ${target}`); score -= 20; }\nif (density < 0.5) { issues.push(`keyword density ${density.toFixed(2)}% too low`); score -= 15; }\nif (density > 2.5) { issues.push(`keyword density ${density.toFixed(2)}% (stuffing)`); score -= 20; critical = true; }\nif (meta.length < 120 || meta.length > 158) { issues.push(`meta length ${meta.length} out of range`); score -= 10; }\nif (!hasH2) { issues.push('no H2 headings'); score -= 15; critical = true; }\nif (!hasH3) { issues.push('no H3 headings'); score -= 5; }\nif (internalLinks < 1) { issues.push('no internal links'); score -= 10; }\nif (avgSentence > 25) { issues.push(`avg sentence ${avgSentence.toFixed(1)} words (hard to read)`); score -= 5; }\nif (!keywordInTitle) { issues.push('keyword missing from title'); score -= 10; }\nif (!keywordInIntro) { issues.push('keyword missing from intro'); score -= 5; }\n\nscore = Math.max(0, score);\nconst pass = score >= 80 && !critical;\n\nreturn [\n  {\n    json: {\n      ...item,\n      draft_html: html,\n      seo: {\n        word_count: wordCount,\n        keyword_density_pct: Number(density.toFixed(2)),\n        meta_length: meta.length,\n        has_h2: hasH2,\n        has_h3: hasH3,\n        internal_links: internalLinks,\n        avg_sentence_words: Number(avgSentence.toFixed(1)),\n        keyword_in_title: keywordInTitle,\n        keyword_in_intro: keywordInIntro\n      },\n      seo_score: score,\n      seo_issues: issues,\n      seo_pass: pass\n    }\n  }\n];"
+      },
+      "id": "node-0017",
+      "name": "SEO Quality Checks",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2740, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cond-pass",
+              "leftValue": "={{ $json.seo_pass }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-0018",
+      "name": "Quality passed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3020, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.WORDPRESS_BASE_URL}}/wp-json/wp/v2/posts",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "wordpressApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"title\": {{ JSON.stringify($json.outline.title) }},\n  \"slug\": {{ JSON.stringify($json.outline.slug) }},\n  \"status\": \"draft\",\n  \"content\": {{ JSON.stringify($json.draft_html) }},\n  \"excerpt\": {{ JSON.stringify($json.outline.meta_description) }}\n}",
+        "options": {}
+      },
+      "id": "node-0019",
+      "name": "Create WordPress Draft",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3300, 80],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "wordpressApi": {
+          "id": "PLACEHOLDER_WP",
+          "name": "WordPress REST"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SLACK_WEBHOOK_URL}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"text\": {{ JSON.stringify(':memo: New SEO draft ready for review\\nKeyword: ' + $json.target_keyword + '\\nScore: ' + $json.seo_score + '/100\\nWords: ' + $json.seo.word_count + '\\nEdit: ' + $env.WORDPRESS_BASE_URL + '/wp-admin/post.php?post=' + ($json.id || '') + '&action=edit') }}\n}",
+        "options": {}
+      },
+      "id": "node-0020",
+      "name": "Notify Reviewer (Slack)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3580, 80],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{$env.CONTENT_QUEUE_URL}}/{{ $('SEO Quality Checks').item.json.queue_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"status\": \"drafted\",\n  \"wp_post_id\": {{ JSON.stringify(String($('Create WordPress Draft').item.json.id || '')) }},\n  \"seo_score\": {{ $('SEO Quality Checks').item.json.seo_score }}\n}",
+        "options": {}
+      },
+      "id": "node-0021",
+      "name": "Mark Queue: drafted",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3860, 80],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "PLACEHOLDER_QUEUE",
+          "name": "Content Queue API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.SLACK_WEBHOOK_URL}}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"text\": {{ JSON.stringify(':warning: SEO draft FAILED quality gate\\nKeyword: ' + $json.target_keyword + '\\nScore: ' + $json.seo_score + '/100\\nIssues: ' + ($json.seo_issues || []).join('; ')) }}\n}",
+        "options": {}
+      },
+      "id": "node-0022",
+      "name": "Flag for Human (Slack)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3300, 360],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{$env.CONTENT_QUEUE_URL}}/{{ $('SEO Quality Checks').item.json.queue_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"status\": \"needs_review\",\n  \"seo_score\": {{ $('SEO Quality Checks').item.json.seo_score }},\n  \"seo_issues\": {{ JSON.stringify(($('SEO Quality Checks').item.json.seo_issues || []).join('; ')) }}\n}",
+        "options": {}
+      },
+      "id": "node-0023",
+      "name": "Mark Queue: needs_review",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3580, 360],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "PLACEHOLDER_QUEUE",
+          "name": "Content Queue API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "numberInputs": 2,
+        "options": {}
+      },
+      "id": "node-0024",
+      "name": "Merge Outcomes",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [4140, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Assemble a single run report row regardless of pass/fail outcome.\nconst seoItem = $('SEO Quality Checks').first().json;\nreturn [\n  {\n    json: {\n      run_id: `seo-${Date.now()}`,\n      run_started_at: seoItem.run_started_at,\n      run_finished_at: new Date().toISOString(),\n      queue_id: seoItem.queue_id,\n      target_keyword: seoItem.target_keyword,\n      seo_score: seoItem.seo_score,\n      seo_pass: seoItem.seo_pass,\n      outcome: seoItem.seo_pass ? 'drafted' : 'needs_review',\n      issues: (seoItem.seo_issues || []).join('; '),\n      word_count: seoItem.seo?.word_count || 0,\n      keyword_density_pct: seoItem.seo?.keyword_density_pct || 0\n    }\n  }\n];"
+      },
+      "id": "node-0025",
+      "name": "Build Run Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [4420, 200]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.RUN_LOG_URL}}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={ {{ JSON.stringify($json) }} }",
+        "options": {}
+      },
+      "id": "node-0026",
+      "name": "Append Run Log",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [4700, 200],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "PLACEHOLDER_QUEUE",
+          "name": "Content Queue API"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "node-0027",
+      "name": "Give Up: flag bad outline",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2460, 440]
+    },
+    {
+      "parameters": {
+        "jsCode": "// On give-up, force a fail outcome so the downstream Slack flag + queue update\n// still run with the outline issues attached.\nconst item = $('Validate Outline').first().json;\nreturn [\n  {\n    json: {\n      ...item,\n      draft_html: '',\n      seo: { word_count: 0, keyword_density_pct: 0, meta_length: item.outline?.meta_description?.length || 0, has_h2: false, has_h3: false, internal_links: 0, avg_sentence_words: 0, keyword_in_title: false, keyword_in_intro: false },\n      seo_score: 0,\n      seo_issues: ['outline failed validation twice', ...(item.outline_issues || [])],\n      seo_pass: false\n    }\n  }\n];"
+      },
+      "id": "node-0028",
+      "name": "Force Fail (bad outline)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2740, 440]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Content Queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Content Queue": {
+      "main": [
+        [
+          {
+            "node": "Pick Next Topic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Next Topic": {
+      "main": [
+        [
+          {
+            "node": "Has topic?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has topic?": {
+      "main": [
+        [
+          {
+            "node": "SERP Research",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Nothing queued",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SERP Research": {
+      "main": [
+        [
+          {
+            "node": "Build Research Brief",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Research Brief",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Research Brief": {
+      "main": [
+        [
+          {
+            "node": "Merge SERP Paths",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge SERP Paths": {
+      "main": [
+        [
+          {
+            "node": "Generate Outline (LLM)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Outline (LLM)": {
+      "main": [
+        [
+          {
+            "node": "Validate Outline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Outline": {
+      "main": [
+        [
+          {
+            "node": "Outline OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Outline OK?": {
+      "main": [
+        [
+          {
+            "node": "Write Draft (LLM)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Generate Outline (LLM)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Give Up: flag bad outline",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Draft (LLM)": {
+      "main": [
+        [
+          {
+            "node": "SEO Quality Checks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SEO Quality Checks": {
+      "main": [
+        [
+          {
+            "node": "Quality passed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Quality passed?": {
+      "main": [
+        [
+          {
+            "node": "Create WordPress Draft",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Flag for Human (Slack)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create WordPress Draft": {
+      "main": [
+        [
+          {
+            "node": "Notify Reviewer (Slack)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Reviewer (Slack)": {
+      "main": [
+        [
+          {
+            "node": "Mark Queue: drafted",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Queue: drafted": {
+      "main": [
+        [
+          {
+            "node": "Merge Outcomes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flag for Human (Slack)": {
+      "main": [
+        [
+          {
+            "node": "Mark Queue: needs_review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Queue: needs_review": {
+      "main": [
+        [
+          {
+            "node": "Merge Outcomes",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Outcomes": {
+      "main": [
+        [
+          {
+            "node": "Build Run Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Run Report": {
+      "main": [
+        [
+          {
+            "node": "Append Run Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Give Up: flag bad outline": {
+      "main": [
+        [
+          {
+            "node": "Force Fail (bad outline)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Force Fail (bad outline)": {
+      "main": [
+        [
+          {
+            "node": "Quality passed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateId": null
+  },
+  "tags": []
+}

@@ -1,0 +1,564 @@
+{
+  "name": "AI Lead Enrichment & Scoring SDR",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## AI Lead Enrichment & Scoring SDR\n\nEntry point: POST /new-lead with JSON { email, name, company, domain, source, message }.\n\nPipeline:\n1. Normalize input\n2. Dedupe by email (workflow static data)\n3. Enrich company + person in parallel\n4. Build feature set\n5. LLM scores fit (0-100) and writes a personalized opener\n6. Tier into hot / warm / cold and route to the right destination\n7. Append an audit log and respond to the caller\n\nNo secrets are stored in this file. All keys live in n8n credentials and environment variables.",
+        "height": 320,
+        "width": 420,
+        "color": 4
+      },
+      "id": "note-0001",
+      "name": "Sticky Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-560, -260]
+    },
+    {
+      "parameters": {
+        "content": "### Scoring model\n\nThe LLM returns strict JSON:\n```\n{\n  \"fit_score\": 0-100,\n  \"reasons\": [\"...\"],\n  \"persona\": \"...\",\n  \"personalized_opener\": \"...\",\n  \"recommended_sequence\": \"...\"\n}\n```\n\nTiering in `Parse & Tier`:\n- HOT  : fit_score >= 80\n- WARM : 50 - 79\n- COLD : < 50\n\nfit_score is clamped to 0-100 and a deterministic fallback tier is applied if the model output is malformed.",
+        "height": 360,
+        "width": 380,
+        "color": 5
+      },
+      "id": "note-0002",
+      "name": "Sticky Scoring",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [2240, -300]
+    },
+    {
+      "parameters": {
+        "content": "### Dedup / static data\n\n`Dedup by Email` keeps a map of seen emails in\n`$getWorkflowStaticData('global')` with a timestamp.\n\nIf the same email arrives within DEDUP_TTL_MS\n(default 24h) the run short-circuits and responds\nwith status `duplicate`. This protects spend on\nenrichment + LLM calls and keeps the workflow\nidempotent against retried form submits and CRM\nwebhook replays.",
+        "height": 300,
+        "width": 380,
+        "color": 6
+      },
+      "id": "note-0003",
+      "name": "Sticky Dedup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-560, 200]
+    },
+    {
+      "parameters": {
+        "content": "### Setup / credentials\n\nCredentials (n8n > Credentials):\n- `enrichApi`      HTTP Header Auth (company + person providers)\n- `openAiApi`      OpenAI API key\n- `crmApi`         HTTP Header Auth (HubSpot / Pipedrive)\n- `slackApi`       HTTP Header Auth (Slack bot token)\n- `emailToolApi`   HTTP Header Auth (sequence / nurture tool)\n- `auditApi`       HTTP Header Auth (audit sink)\n\nEnvironment variables:\n- ENRICH_API_URL, OPENAI_MODEL, CRM_API_URL,\n  SLACK_API_URL, EMAIL_TOOL_URL, AUDIT_API_URL,\n  DEDUP_TTL_MS\n\nEnrichment nodes use `continueErrorOutput` so a\nprovider outage degrades gracefully instead of\nfailing the whole run.",
+        "height": 420,
+        "width": 420,
+        "color": 3
+      },
+      "id": "note-0004",
+      "name": "Sticky Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [620, 220]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "new-lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-0001",
+      "name": "New Lead",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-280, -40],
+      "webhookId": "ai-lead-sdr-new-lead"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "email",
+              "value": "={{ ($json.body.email || '').toString().trim().toLowerCase() }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "name",
+              "value": "={{ ($json.body.name || '').toString().trim() }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "company",
+              "value": "={{ ($json.body.company || '').toString().trim() }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "domain",
+              "value": "={{ ($json.body.domain || ($json.body.email || '').toString().split('@')[1] || '').toLowerCase() }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "source",
+              "value": "={{ ($json.body.source || 'unknown').toString() }}",
+              "type": "string"
+            },
+            {
+              "id": "a6",
+              "name": "message",
+              "value": "={{ ($json.body.message || '').toString() }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-0002",
+      "name": "Normalize Lead",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [0, -40]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Dedupe leads by email using workflow-global static data.\n// Cost control + idempotency: identical leads inside the TTL window\n// are short-circuited before any paid enrichment / LLM call.\nconst staticData = $getWorkflowStaticData('global');\nif (!staticData.seenLeads) staticData.seenLeads = {};\n\nconst ttlMs = Number($env.DEDUP_TTL_MS || 86400000); // default 24h\nconst now = Date.now();\n\n// prune expired entries so the map does not grow unbounded\nfor (const key of Object.keys(staticData.seenLeads)) {\n  if (now - staticData.seenLeads[key] > ttlMs) delete staticData.seenLeads[key];\n}\n\nconst item = $input.first().json;\nconst email = (item.email || '').trim().toLowerCase();\n\nif (!email || !email.includes('@')) {\n  return [{ json: { ...item, _dedup: 'invalid', _isDuplicate: true } }];\n}\n\nconst lastSeen = staticData.seenLeads[email];\nconst isDuplicate = lastSeen !== undefined && (now - lastSeen) <= ttlMs;\n\nif (!isDuplicate) {\n  staticData.seenLeads[email] = now;\n}\n\nconst leadId = email + ':' + now.toString(36);\n\nreturn [{ json: { ...item, lead_id: leadId, _isDuplicate: isDuplicate, _dedup: isDuplicate ? 'duplicate' : 'new' } }];"
+      },
+      "id": "node-0003",
+      "name": "Dedup by Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [280, -40]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose", "version": 2 },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json._isDuplicate }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-0004",
+      "name": "Is Duplicate?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [560, -40]
+    },
+    {
+      "parameters": {},
+      "id": "node-0005",
+      "name": "Skip Duplicate",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [840, -200]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ lead_id: $json.lead_id, tier: null, fit_score: null, action: 'skipped', status: 'duplicate' }) }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "node-0006",
+      "name": "Respond Duplicate",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1120, -200]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.ENRICH_API_URL }}/v2/companies/find?domain={{ $json.domain }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "node-0007",
+      "name": "Enrich Company",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [840, 60],
+      "credentials": { "httpHeaderAuth": { "id": "enrichApi", "name": "enrichApi" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.ENRICH_API_URL }}/v2/people/find?email={{ $json.email }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "id": "node-0008",
+      "name": "Enrich Person",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [840, 280],
+      "credentials": { "httpHeaderAuth": { "id": "enrichApi", "name": "enrichApi" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "id": "node-0009",
+      "name": "Merge Enrichment",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1120, 160]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Assemble a clean feature set from the lead + both enrichment calls.\n// Enrichment providers may have failed (continueErrorOutput) so every\n// field is read defensively with sane fallbacks.\nconst items = $input.all();\n\n// position-combine merges two inputs; pick whichever objects exist\nfunction get(obj, path, dflt) {\n  try {\n    return path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj) ?? dflt;\n  } catch (e) { return dflt; }\n}\n\n// The lead context survives through the Normalize/Dedup nodes\nconst lead = $('Dedup by Email').first().json;\n\n// Gather any enrichment payloads present on the merged items\nlet company = {};\nlet person = {};\nfor (const it of items) {\n  const j = it.json || {};\n  if (j.company || j.industry || j.metrics) company = { ...company, ...(j.company || j) };\n  if (j.person || j.title || j.seniority) person = { ...person, ...(j.person || j) };\n}\n\nconst features = {\n  lead_id: lead.lead_id,\n  email: lead.email,\n  name: lead.name,\n  source: lead.source,\n  message: lead.message,\n  company_name: get(company, 'name', lead.company || 'unknown'),\n  domain: lead.domain || get(company, 'domain', ''),\n  industry: get(company, 'category.industry', get(company, 'industry', 'unknown')),\n  employee_count: Number(get(company, 'metrics.employees', get(company, 'employee_count', 0))) || 0,\n  estimated_revenue: get(company, 'metrics.estimatedAnnualRevenue', get(company, 'revenue', 'unknown')),\n  tech_stack: get(company, 'tech', get(company, 'tech_stack', [])),\n  country: get(company, 'geo.country', get(company, 'country', 'unknown')),\n  person_title: get(person, 'employment.title', get(person, 'title', 'unknown')),\n  seniority: get(person, 'employment.seniority', get(person, 'seniority', 'unknown')),\n  enrichment_ok: !!(company && Object.keys(company).length) || !!(person && Object.keys(person).length)\n};\n\nreturn [{ json: features }];"
+      },
+      "id": "node-0010",
+      "name": "Build Feature Set",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1400, 160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: ($env.OPENAI_MODEL || 'gpt-4o'),\n  temperature: 0.3,\n  response_format: { type: 'json_object' },\n  messages: [\n    { role: 'system', content: 'You are an SDR scoring engine. Score the lead fit for a B2B sales team and write one personalized opening line. Respond ONLY with strict JSON: {\"fit_score\": number 0-100, \"reasons\": string[], \"persona\": string, \"personalized_opener\": string, \"recommended_sequence\": string}.' },\n    { role: 'user', content: 'Lead and firmographics:\\n' + JSON.stringify($json) }\n  ]\n}) }}",
+        "options": {}
+      },
+      "id": "node-0011",
+      "name": "Score & Personalize (LLM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1680, 160],
+      "credentials": { "openAiApi": { "id": "openAiApi", "name": "openAiApi" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the LLM JSON, clamp the score, derive the tier deterministically.\nconst features = $('Build Feature Set').first().json;\nconst resp = $input.first().json;\n\nlet parsed = {};\ntry {\n  const raw = resp.choices && resp.choices[0] && resp.choices[0].message && resp.choices[0].message.content;\n  parsed = typeof raw === 'string' ? JSON.parse(raw) : (raw || {});\n} catch (e) {\n  parsed = {};\n}\n\nlet score = Number(parsed.fit_score);\nif (!Number.isFinite(score)) score = 0;\nscore = Math.max(0, Math.min(100, Math.round(score)));\n\nlet tier = 'cold';\nif (score >= 80) tier = 'hot';\nelse if (score >= 50) tier = 'warm';\n\nreturn [{\n  json: {\n    ...features,\n    fit_score: score,\n    tier,\n    reasons: Array.isArray(parsed.reasons) ? parsed.reasons : [],\n    persona: parsed.persona || 'unknown',\n    personalized_opener: parsed.personalized_opener || '',\n    recommended_sequence: parsed.recommended_sequence || 'default',\n    scored_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "node-0012",
+      "name": "Parse & Tier",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1960, 160]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "loose", "version": 2 },
+                "conditions": [
+                  {
+                    "id": "r1",
+                    "leftValue": "={{ $json.tier }}",
+                    "rightValue": "hot",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "hot"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "loose", "version": 2 },
+                "conditions": [
+                  {
+                    "id": "r2",
+                    "leftValue": "={{ $json.tier }}",
+                    "rightValue": "warm",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "warm"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "loose", "version": 2 },
+                "conditions": [
+                  {
+                    "id": "r3",
+                    "leftValue": "={{ $json.tier }}",
+                    "rightValue": "cold",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "cold"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-0013",
+      "name": "Route by Tier",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [2240, 160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CRM_API_URL }}/deals",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ name: ($json.company_name + ' - inbound'), contact_email: $json.email, fit_score: $json.fit_score, persona: $json.persona, source: $json.source }) }}",
+        "options": {}
+      },
+      "id": "node-0014",
+      "name": "Create CRM Deal",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2560, -120],
+      "credentials": { "httpHeaderAuth": { "id": "crmApi", "name": "crmApi" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_API_URL }}/chat.postMessage",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ channel: '#sales-hot-leads', text: 'HOT lead ' + $json.fit_score + '/100: ' + $json.name + ' @ ' + $json.company_name + '\\nOpener: ' + $json.personalized_opener }) }}",
+        "options": {}
+      },
+      "id": "node-0015",
+      "name": "Notify Sales (Slack)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2840, -120],
+      "credentials": { "httpHeaderAuth": { "id": "slackApi", "name": "slackApi" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.EMAIL_TOOL_URL }}/drafts",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ to: $json.email, subject: 'Quick idea for ' + $json.company_name, body: $json.personalized_opener, sequence: $json.recommended_sequence, status: 'draft' }) }}",
+        "options": {}
+      },
+      "id": "node-0016",
+      "name": "Draft Outreach Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3120, -120],
+      "credentials": { "httpHeaderAuth": { "id": "emailToolApi", "name": "emailToolApi" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.EMAIL_TOOL_URL }}/sequences/nurture/contacts",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ email: $json.email, name: $json.name, sequence: $json.recommended_sequence, first_touch: $json.personalized_opener }) }}",
+        "options": {}
+      },
+      "id": "node-0017",
+      "name": "Add to Nurture Sequence",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2560, 160],
+      "credentials": { "httpHeaderAuth": { "id": "emailToolApi", "name": "emailToolApi" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.CRM_API_URL }}/contacts",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ email: $json.email, name: $json.name, lifecycle_stage: 'low_priority', fit_score: $json.fit_score, source: $json.source }) }}",
+        "options": {}
+      },
+      "id": "node-0018",
+      "name": "Log Cold Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2560, 440],
+      "credentials": { "httpHeaderAuth": { "id": "crmApi", "name": "crmApi" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {},
+      "id": "node-0019",
+      "name": "Merge Branches",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [3400, 160]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the final result object + an audit record.\nconst j = $input.first().json;\n\nconst actionByTier = {\n  hot: 'crm_deal+slack+draft_email',\n  warm: 'nurture_sequence',\n  cold: 'logged_low_priority'\n};\n\nconst result = {\n  lead_id: j.lead_id,\n  email: j.email,\n  tier: j.tier,\n  fit_score: j.fit_score,\n  persona: j.persona,\n  action: actionByTier[j.tier] || 'none',\n  recommended_sequence: j.recommended_sequence,\n  status: 'processed'\n};\n\nconst audit = {\n  ...result,\n  reasons: j.reasons,\n  enrichment_ok: j.enrichment_ok,\n  company_name: j.company_name,\n  industry: j.industry,\n  employee_count: j.employee_count,\n  source: j.source,\n  scored_at: j.scored_at,\n  audited_at: new Date().toISOString()\n};\n\nreturn [{ json: { result, audit } }];"
+      },
+      "id": "node-0020",
+      "name": "Build Result + Audit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3680, 160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AUDIT_API_URL }}/lead-events",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.audit) }}",
+        "options": {}
+      },
+      "id": "node-0021",
+      "name": "Append Audit Log",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3960, 160],
+      "credentials": { "httpHeaderAuth": { "id": "auditApi", "name": "auditApi" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.result) }}",
+        "options": { "responseCode": 200 }
+      },
+      "id": "node-0022",
+      "name": "Respond Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [4240, 160]
+    }
+  ],
+  "connections": {
+    "New Lead": {
+      "main": [[{ "node": "Normalize Lead", "type": "main", "index": 0 }]]
+    },
+    "Normalize Lead": {
+      "main": [[{ "node": "Dedup by Email", "type": "main", "index": 0 }]]
+    },
+    "Dedup by Email": {
+      "main": [[{ "node": "Is Duplicate?", "type": "main", "index": 0 }]]
+    },
+    "Is Duplicate?": {
+      "main": [
+        [{ "node": "Skip Duplicate", "type": "main", "index": 0 }],
+        [
+          { "node": "Enrich Company", "type": "main", "index": 0 },
+          { "node": "Enrich Person", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Skip Duplicate": {
+      "main": [[{ "node": "Respond Duplicate", "type": "main", "index": 0 }]]
+    },
+    "Enrich Company": {
+      "main": [
+        [{ "node": "Merge Enrichment", "type": "main", "index": 0 }],
+        [{ "node": "Merge Enrichment", "type": "main", "index": 0 }]
+      ]
+    },
+    "Enrich Person": {
+      "main": [
+        [{ "node": "Merge Enrichment", "type": "main", "index": 1 }],
+        [{ "node": "Merge Enrichment", "type": "main", "index": 1 }]
+      ]
+    },
+    "Merge Enrichment": {
+      "main": [[{ "node": "Build Feature Set", "type": "main", "index": 0 }]]
+    },
+    "Build Feature Set": {
+      "main": [[{ "node": "Score & Personalize (LLM)", "type": "main", "index": 0 }]]
+    },
+    "Score & Personalize (LLM)": {
+      "main": [[{ "node": "Parse & Tier", "type": "main", "index": 0 }]]
+    },
+    "Parse & Tier": {
+      "main": [[{ "node": "Route by Tier", "type": "main", "index": 0 }]]
+    },
+    "Route by Tier": {
+      "main": [
+        [{ "node": "Create CRM Deal", "type": "main", "index": 0 }],
+        [{ "node": "Add to Nurture Sequence", "type": "main", "index": 0 }],
+        [{ "node": "Log Cold Lead", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create CRM Deal": {
+      "main": [[{ "node": "Notify Sales (Slack)", "type": "main", "index": 0 }]]
+    },
+    "Notify Sales (Slack)": {
+      "main": [[{ "node": "Draft Outreach Email", "type": "main", "index": 0 }]]
+    },
+    "Draft Outreach Email": {
+      "main": [[{ "node": "Merge Branches", "type": "main", "index": 0 }]]
+    },
+    "Add to Nurture Sequence": {
+      "main": [[{ "node": "Merge Branches", "type": "main", "index": 0 }]]
+    },
+    "Log Cold Lead": {
+      "main": [[{ "node": "Merge Branches", "type": "main", "index": 0 }]]
+    },
+    "Merge Branches": {
+      "main": [[{ "node": "Build Result + Audit", "type": "main", "index": 0 }]]
+    },
+    "Build Result + Audit": {
+      "main": [[{ "node": "Append Audit Log", "type": "main", "index": 0 }]]
+    },
+    "Append Audit Log": {
+      "main": [[{ "node": "Respond Result", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {},
+  "meta": { "templateId": null },
+  "tags": []
+}

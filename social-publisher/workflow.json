@@ -1,0 +1,778 @@
+{
+  "name": "Multi-Platform Social Publisher",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Multi-Platform Social Publisher\n\nWhen a blog post is published, this workflow:\n1. Generates platform-tailored copy with an LLM (Facebook, Instagram, X thread, LinkedIn).\n2. Enforces per-platform character limits, appends UTM tags, and attaches hashtags.\n3. Sends every variant to a human for ONE approval via Slack.\n4. Pauses on a Wait node until the approver clicks Approve or Reject (resume-on-webhook).\n5. On approval, fans out to each platform API with retries and per-branch error isolation.\n6. Collects post IDs, appends them to a tracking sheet, and reports the result.\n\nEntry: POST /blog-published  ->  Response: { status, results }",
+        "height": 320,
+        "width": 460,
+        "color": 4
+      },
+      "id": "node-0001",
+      "name": "Sticky Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-520, -200]
+    },
+    {
+      "parameters": {
+        "content": "### Human Approval Gate\n\nThe **Await Approval** node is a Wait node configured with `resume: webhook`. The run pauses indefinitely and exposes `$execution.resumeUrl`.\n\nThe **Post Approval Request** node sends that URL to Slack with Approve / Reject buttons (Block Kit). The approver's click POSTs `{ decision, edited? }` back to the resume URL, which wakes the exact paused execution.\n\nNothing is published before this gate. A reject path notifies Slack and aborts cleanly.",
+        "height": 320,
+        "width": 420,
+        "color": 5
+      },
+      "id": "node-0002",
+      "name": "Sticky Approval",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [820, -200]
+    },
+    {
+      "parameters": {
+        "content": "### Per-Platform API Notes\n\n- **Facebook**: POST /{PAGE_ID}/feed with message + link. Page access token via Facebook Graph credential.\n- **Instagram**: two-step. Create media container (POST /{IG_ID}/media), then publish (POST /{IG_ID}/media_publish) with the returned creation_id.\n- **X / Twitter**: thread posted tweet-by-tweet in a Loop, chaining `reply.in_reply_to_tweet_id` to the previous id.\n- **LinkedIn**: POST /v2/ugcPosts as an article share.\n\nEvery API node uses retryOnFail (3 tries, 2s) and continueErrorOutput so one failing platform never blocks the others.",
+        "height": 360,
+        "width": 440,
+        "color": 6
+      },
+      "id": "node-0003",
+      "name": "Sticky Platforms",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [2480, -260]
+    },
+    {
+      "parameters": {
+        "content": "### Setup & Credentials\n\nCredentials (n8n Credential store):\n- facebookGraphApi (FB Page + IG publish)\n- twitterOAuth2Api (X v2)\n- linkedInOAuth2Api\n- httpHeaderAuth (Slack bot token, tracking sheet)\n- OpenAI key on the LLM node\n\nEnv vars:\nFB_PAGE_ID, IG_USER_ID, LINKEDIN_AUTHOR_URN, SLACK_CHANNEL_ID, TRACKING_SHEET_WEBHOOK, OPENAI_MODEL\n\nSee README for the full table and import steps.",
+        "height": 340,
+        "width": 420,
+        "color": 7
+      },
+      "id": "node-0004",
+      "name": "Sticky Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-520, 180]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "blog-published",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "node-0010",
+      "name": "Blog Published",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-40, 0],
+      "webhookId": "blog-published-hook"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "title",
+              "value": "={{ $json.body.title }}",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "url",
+              "value": "={{ $json.body.url }}",
+              "type": "string"
+            },
+            {
+              "id": "a3",
+              "name": "excerpt",
+              "value": "={{ $json.body.excerpt }}",
+              "type": "string"
+            },
+            {
+              "id": "a4",
+              "name": "image_url",
+              "value": "={{ $json.body.image_url }}",
+              "type": "string"
+            },
+            {
+              "id": "a5",
+              "name": "tags",
+              "value": "={{ $json.body.tags || [] }}",
+              "type": "array"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-0020",
+      "name": "Normalize Source",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [240, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"model\": \"{{ $env.OPENAI_MODEL || 'gpt-4o' }}\",\n  \"response_format\": { \"type\": \"json_object\" },\n  \"temperature\": 0.7,\n  \"messages\": [\n    {\n      \"role\": \"system\",\n      \"content\": \"You are a senior social media copywriter. Given a blog post, return STRICT JSON with platform-tailored copy. Schema: {\\\"facebook\\\":{\\\"text\\\":string},\\\"instagram\\\":{\\\"caption\\\":string},\\\"x\\\":{\\\"thread\\\":[string]},\\\"linkedin\\\":{\\\"text\\\":string},\\\"hashtags\\\":[string]}. The X thread must be an array of 2 to 4 short tweets each under 240 chars before hashtags. Hashtags must not include the # symbol. Do not include the URL inside any text; it is appended later.\"\n    },\n    {\n      \"role\": \"user\",\n      \"content\": \"Title: {{ $json.title }}\\nExcerpt: {{ $json.excerpt }}\\nTags: {{ ($json.tags || []).join(', ') }}\"\n    }\n  ]\n}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": false
+            }
+          }
+        }
+      },
+      "id": "node-0030",
+      "name": "Generate Variants (LLM)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 0],
+      "credentials": {
+        "openAiApi": {
+          "id": "OPENAI_CRED",
+          "name": "OpenAI account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the LLM response, enforce per-platform rules, build payloads.\nconst src = $('Normalize Source').first().json;\nconst raw = $input.first().json;\n\n// OpenAI chat completion -> content string -> JSON\nlet content = raw?.choices?.[0]?.message?.content || raw?.message?.content || '{}';\nlet variants;\ntry { variants = JSON.parse(content); } catch (e) { throw new Error('LLM did not return valid JSON: ' + content.slice(0, 200)); }\n\nconst LIMITS = { x: 280, instagram: 2200, linkedin: 3000, facebook: 63206 };\n\nconst withUtm = (url, source) => {\n  const u = new URL(url);\n  u.searchParams.set('utm_source', source);\n  u.searchParams.set('utm_medium', 'social');\n  u.searchParams.set('utm_campaign', 'blog_autopublish');\n  return u.toString();\n};\n\nconst tags = (variants.hashtags || []).map(h => '#' + String(h).replace(/^#/, '').replace(/\\s+/g, '')).filter(Boolean);\nconst tagLine = tags.slice(0, 8).join(' ');\n\nconst clamp = (text, max) => {\n  text = (text || '').trim();\n  if (text.length <= max) return text;\n  return text.slice(0, max - 1).trimEnd() + '\\u2026';\n};\n\n// Facebook: message + link (link rendered as preview card)\nconst fbLink = withUtm(src.url, 'facebook');\nconst fbText = clamp(`${variants.facebook?.text || src.title}\\n\\n${tagLine}`, LIMITS.facebook);\n\n// Instagram: caption + tags inline (no clickable link in caption)\nconst igCaption = clamp(`${variants.instagram?.caption || src.title}\\n\\nLink in bio.\\n\\n${tagLine}`, LIMITS.instagram);\n\n// LinkedIn: text + link appended\nconst liLink = withUtm(src.url, 'linkedin');\nconst liText = clamp(`${variants.linkedin?.text || src.title}\\n\\n${liLink}\\n\\n${tagLine}`, LIMITS.linkedin);\n\n// X: thread of tweets, each clamped to 280; URL on the first tweet, tags on last\nconst xLink = withUtm(src.url, 'twitter');\nlet thread = Array.isArray(variants.x?.thread) ? variants.x.thread.slice(0, 6) : [variants.x?.text || src.title];\nthread = thread.filter(t => t && String(t).trim());\nconst tweets = thread.map((t, i) => {\n  let body = String(t).trim();\n  if (i === 0) body = clamp(body + ' ' + xLink, LIMITS.x);\n  else if (i === thread.length - 1) body = clamp(body + ' ' + tagLine, LIMITS.x);\n  else body = clamp(body, LIMITS.x);\n  return { index: i, text: body };\n});\n\nconst payload = {\n  source: { title: src.title, url: src.url, image_url: src.image_url },\n  facebook: { message: fbText, link: fbLink },\n  instagram: { caption: igCaption, image_url: src.image_url },\n  x: { tweets },\n  linkedin: { text: liText },\n  hashtags: tags\n};\n\nreturn [{ json: payload }];"
+      },
+      "id": "node-0040",
+      "name": "Enforce Platform Rules",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [800, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"channel\": \"{{ $env.SLACK_CHANNEL_ID }}\",\n  \"text\": \"New blog post ready to publish: {{ $('Normalize Source').first().json.title }}\",\n  \"blocks\": [\n    { \"type\": \"header\", \"text\": { \"type\": \"plain_text\", \"text\": \"Approve social publish?\" } },\n    { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*Post:* {{ $('Normalize Source').first().json.title }}\\n*URL:* {{ $('Normalize Source').first().json.url }}\" } },\n    { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*Facebook:*\\n{{ JSON.stringify($json.facebook.message).slice(1,400) }}\" } },\n    { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*Instagram:*\\n{{ JSON.stringify($json.instagram.caption).slice(1,400) }}\" } },\n    { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*X thread ({{ $json.x.tweets.length }} tweets):*\\n{{ JSON.stringify($json.x.tweets.map(t => t.text).join(' || ')).slice(1,400) }}\" } },\n    { \"type\": \"section\", \"text\": { \"type\": \"mrkdwn\", \"text\": \"*LinkedIn:*\\n{{ JSON.stringify($json.linkedin.text).slice(1,400) }}\" } },\n    { \"type\": \"actions\", \"elements\": [\n      { \"type\": \"button\", \"style\": \"primary\", \"text\": { \"type\": \"plain_text\", \"text\": \"Approve\" }, \"url\": \"{{ $execution.resumeUrl }}?decision=approve\" },\n      { \"type\": \"button\", \"style\": \"danger\", \"text\": { \"type\": \"plain_text\", \"text\": \"Reject\" }, \"url\": \"{{ $execution.resumeUrl }}?decision=reject\" }\n    ] }\n  ]\n}",
+        "options": {}
+      },
+      "id": "node-0050",
+      "name": "Post Approval Request",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1080, 0],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SLACK_CRED",
+          "name": "Slack Bot Token"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "options": {
+          "webhookSuffix": "approval"
+        }
+      },
+      "id": "node-0060",
+      "name": "Await Approval",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1360, 0],
+      "webhookId": "await-approval-hook"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.query?.decision || $json.body?.decision }}",
+              "rightValue": "approve",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-0070",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1640, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"channel\": \"{{ $env.SLACK_CHANNEL_ID }}\",\n  \"text\": \"Publish for *{{ $('Normalize Source').first().json.title }}* was rejected. Nothing was posted.\"\n}",
+        "options": {}
+      },
+      "id": "node-0080",
+      "name": "Notify Rejected",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1920, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SLACK_CRED",
+          "name": "Slack Bot Token"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"status\": \"rejected\",\n  \"results\": []\n}",
+        "options": {}
+      },
+      "id": "node-0090",
+      "name": "Respond Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2200, 200]
+    },
+    {
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "outputKey": "facebook",
+              "conditions": {
+                "options": { "caseSensitive": true, "typeValidation": "loose", "version": 2 },
+                "conditions": [
+                  { "id": "s1", "leftValue": "1", "rightValue": "1", "operator": { "type": "string", "operation": "equals" } }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-0100",
+      "name": "Fan Out Platforms",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1920, -40]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $env.FB_PAGE_ID }}/feed",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "facebookGraphApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"message\": {{ JSON.stringify($('Enforce Platform Rules').first().json.facebook.message) }},\n  \"link\": \"{{ $('Enforce Platform Rules').first().json.facebook.link }}\"\n}",
+        "options": {}
+      },
+      "id": "node-0110",
+      "name": "Facebook Post",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2200, -360],
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "FB_CRED",
+          "name": "Facebook Graph account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $env.IG_USER_ID }}/media",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "facebookGraphApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"image_url\": \"{{ $('Enforce Platform Rules').first().json.instagram.image_url }}\",\n  \"caption\": {{ JSON.stringify($('Enforce Platform Rules').first().json.instagram.caption) }}\n}",
+        "options": {}
+      },
+      "id": "node-0120",
+      "name": "IG Create Container",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2200, -180],
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "FB_CRED",
+          "name": "Facebook Graph account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $env.IG_USER_ID }}/media_publish",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "facebookGraphApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"creation_id\": \"{{ $json.id }}\"\n}",
+        "options": {}
+      },
+      "id": "node-0130",
+      "name": "IG Publish",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2480, -180],
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "FB_CRED",
+          "name": "Facebook Graph account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "x.tweets",
+        "options": {}
+      },
+      "id": "node-0140",
+      "name": "Split X Tweets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2200, 0]
+    },
+    {
+      "parameters": {
+        "options": {
+          "reset": false
+        }
+      },
+      "id": "node-0150",
+      "name": "Loop Over Tweets",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [2480, 0]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.twitter.com/2/tweets",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "twitterOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"text\": {{ JSON.stringify($json.text) }}{{ $json.index > 0 ? ',\\n  \"reply\": { \"in_reply_to_tweet_id\": \"' + ($runIndex > 0 ? $('Post Tweet').last().json.data.id : '') + '\" }' : '' }}\n}",
+        "options": {}
+      },
+      "id": "node-0160",
+      "name": "Post Tweet",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2760, 80],
+      "credentials": {
+        "twitterOAuth2Api": {
+          "id": "X_CRED",
+          "name": "X OAuth2 account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.linkedin.com/v2/ugcPosts",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "linkedInOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Restli-Protocol-Version",
+              "value": "2.0.0"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"author\": \"{{ $env.LINKEDIN_AUTHOR_URN }}\",\n  \"lifecycleState\": \"PUBLISHED\",\n  \"specificContent\": {\n    \"com.linkedin.ugc.ShareContent\": {\n      \"shareCommentary\": { \"text\": {{ JSON.stringify($('Enforce Platform Rules').first().json.linkedin.text) }} },\n      \"shareMediaCategory\": \"ARTICLE\",\n      \"media\": [ { \"status\": \"READY\", \"originalUrl\": \"{{ $('Enforce Platform Rules').first().json.facebook.link }}\" } ]\n    }\n  },\n  \"visibility\": { \"com.linkedin.ugc.MemberNetworkVisibility\": \"PUBLIC\" }\n}",
+        "options": {}
+      },
+      "id": "node-0170",
+      "name": "LinkedIn Post",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2200, 180],
+      "credentials": {
+        "linkedInOAuth2Api": {
+          "id": "LI_CRED",
+          "name": "LinkedIn OAuth2 account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Collapse the X loop results into one summary item for this branch.\nconst items = $input.all();\nconst ids = items.map(i => i.json?.data?.id).filter(Boolean);\nreturn [{ json: { platform: 'x', ok: ids.length > 0, post_ids: ids, count: ids.length } }];"
+      },
+      "id": "node-0180",
+      "name": "Collect X Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3040, 80]
+    },
+    {
+      "parameters": {
+        "numberInputs": 4,
+        "options": {}
+      },
+      "id": "node-0190",
+      "name": "Merge Results",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [3320, -40]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalize every branch into a common {platform, ok, post_id|post_ids, error} record.\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  if (j.platform === 'x') { out.push({ platform: 'x', ok: !!j.ok, post_ids: j.post_ids || [], post_id: (j.post_ids || [])[0] || null }); continue; }\n  if (j.id && /^\\d+_\\d+$/.test(String(j.id))) { out.push({ platform: 'facebook', ok: true, post_id: j.id }); continue; }\n  if (j.id && !j.error) { out.push({ platform: 'instagram', ok: true, post_id: j.id }); continue; }\n  if (j.id && j.id.startsWith && j.id.startsWith('urn:li:share')) { out.push({ platform: 'linkedin', ok: true, post_id: j.id }); continue; }\n  if (j.error) { out.push({ platform: j.platform || 'unknown', ok: false, error: typeof j.error === 'string' ? j.error : JSON.stringify(j.error) }); continue; }\n  out.push({ platform: j.platform || 'unknown', ok: !j.error, post_id: j.id || null, raw: j });\n}\nconst src = $('Normalize Source').first().json;\nreturn [{ json: {\n  title: src.title,\n  url: src.url,\n  published_at: new Date().toISOString(),\n  results: out,\n  succeeded: out.filter(r => r.ok).map(r => r.platform),\n  failed: out.filter(r => !r.ok).map(r => r.platform)\n} }];"
+      },
+      "id": "node-0200",
+      "name": "Collect Post IDs & Status",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3600, -40]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.TRACKING_SHEET_WEBHOOK }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"title\": {{ JSON.stringify($json.title) }},\n  \"url\": \"{{ $json.url }}\",\n  \"published_at\": \"{{ $json.published_at }}\",\n  \"succeeded\": \"{{ $json.succeeded.join(', ') }}\",\n  \"failed\": \"{{ $json.failed.join(', ') }}\",\n  \"results\": {{ JSON.stringify($json.results) }}\n}",
+        "options": {}
+      },
+      "id": "node-0210",
+      "name": "Append to Tracking Sheet",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3880, -40],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"channel\": \"{{ $env.SLACK_CHANNEL_ID }}\",\n  \"text\": \"Published *{{ $('Collect Post IDs & Status').first().json.title }}*. Succeeded: {{ $('Collect Post IDs & Status').first().json.succeeded.join(', ') || 'none' }}. Failed: {{ $('Collect Post IDs & Status').first().json.failed.join(', ') || 'none' }}.\"\n}",
+        "options": {}
+      },
+      "id": "node-0220",
+      "name": "Post Summary to Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [4160, -40],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "SLACK_CRED",
+          "name": "Slack Bot Token"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={\n  \"status\": \"published\",\n  \"results\": {{ JSON.stringify($('Collect Post IDs & Status').first().json.results) }}\n}",
+        "options": {}
+      },
+      "id": "node-0230",
+      "name": "Respond Published",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [4440, -40]
+    },
+    {
+      "parameters": {},
+      "id": "node-0240",
+      "name": "No Op (Branch Sync)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2760, -180]
+    }
+  ],
+  "connections": {
+    "Blog Published": {
+      "main": [
+        [
+          { "node": "Normalize Source", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Normalize Source": {
+      "main": [
+        [
+          { "node": "Generate Variants (LLM)", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Generate Variants (LLM)": {
+      "main": [
+        [
+          { "node": "Enforce Platform Rules", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Enforce Platform Rules": {
+      "main": [
+        [
+          { "node": "Post Approval Request", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Post Approval Request": {
+      "main": [
+        [
+          { "node": "Await Approval", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Await Approval": {
+      "main": [
+        [
+          { "node": "Approved?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Approved?": {
+      "main": [
+        [
+          { "node": "Fan Out Platforms", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Notify Rejected", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Notify Rejected": {
+      "main": [
+        [
+          { "node": "Respond Rejected", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Fan Out Platforms": {
+      "main": [
+        [
+          { "node": "Facebook Post", "type": "main", "index": 0 },
+          { "node": "IG Create Container", "type": "main", "index": 0 },
+          { "node": "Split X Tweets", "type": "main", "index": 0 },
+          { "node": "LinkedIn Post", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Facebook Post": {
+      "main": [
+        [
+          { "node": "Merge Results", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Merge Results", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "IG Create Container": {
+      "main": [
+        [
+          { "node": "IG Publish", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Merge Results", "type": "main", "index": 1 }
+        ]
+      ]
+    },
+    "IG Publish": {
+      "main": [
+        [
+          { "node": "No Op (Branch Sync)", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Merge Results", "type": "main", "index": 1 }
+        ]
+      ]
+    },
+    "No Op (Branch Sync)": {
+      "main": [
+        [
+          { "node": "Merge Results", "type": "main", "index": 1 }
+        ]
+      ]
+    },
+    "Split X Tweets": {
+      "main": [
+        [
+          { "node": "Loop Over Tweets", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Loop Over Tweets": {
+      "main": [
+        [
+          { "node": "Collect X Result", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Post Tweet", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Post Tweet": {
+      "main": [
+        [
+          { "node": "Loop Over Tweets", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Loop Over Tweets", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Collect X Result": {
+      "main": [
+        [
+          { "node": "Merge Results", "type": "main", "index": 2 }
+        ]
+      ]
+    },
+    "LinkedIn Post": {
+      "main": [
+        [
+          { "node": "Merge Results", "type": "main", "index": 3 }
+        ],
+        [
+          { "node": "Merge Results", "type": "main", "index": 3 }
+        ]
+      ]
+    },
+    "Merge Results": {
+      "main": [
+        [
+          { "node": "Collect Post IDs & Status", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Collect Post IDs & Status": {
+      "main": [
+        [
+          { "node": "Append to Tracking Sheet", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Append to Tracking Sheet": {
+      "main": [
+        [
+          { "node": "Post Summary to Slack", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Post Summary to Slack": {
+      "main": [
+        [
+          { "node": "Respond Published", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "templateId": null
+  },
+  "tags": []
+}

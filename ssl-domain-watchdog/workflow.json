@@ -1,0 +1,619 @@
+{
+  "name": "SSL & Domain Expiry Watchdog",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SSL & Domain Expiry Watchdog\n\nRuns daily at 08:00. For every domain in the watchlist it checks:\n\n1. TLS certificate days-to-expiry\n2. Domain registration (WHOIS) days-to-expiry\n\nIt computes the worst-case severity per domain, suppresses repeat alerts for the same day using workflow static data, opens an incident ticket for anything critical, fires an urgent Slack message, and finishes by emailing/posting a single daily digest.\n\nSeverity bands:\n- critical: < 7 days\n- warning:  < 21 days\n- ok:       otherwise",
+        "height": 360,
+        "width": 420
+      },
+      "id": "node-0001",
+      "name": "Sticky Overview",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-560, -120]
+    },
+    {
+      "parameters": {
+        "content": "## The hard parts\n\n**Idempotency / no alert spam.** The `Dedup vs Static Data` node uses `$getWorkflowStaticData('global')` to remember which domain+severity pairs already alerted today. On the next run the same critical domain is skipped, so on-call is not paged every 24h for a slow-burning issue.\n\n**Worst-of-two severity.** A domain can have a healthy cert but an expiring registration (or vice versa). `Compute Severity` parses both and escalates to the worse of the two.\n\n**Partial failures.** WHOIS providers are flaky. The WHOIS node uses `continueErrorOutput` so one dead lookup does not abort the whole run; the domain is still scored on cert data alone.",
+        "height": 360,
+        "width": 420
+      },
+      "id": "node-0002",
+      "name": "Sticky Hard Parts",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-100, -120]
+    },
+    {
+      "parameters": {
+        "content": "## Setup / credentials\n\nCreate these in n8n > Credentials and map the placeholder ids:\n\n- **Cert API key** (httpHeaderAuth) -> `Check TLS Cert`\n- **WHOIS API key** (httpHeaderAuth) -> `Check WHOIS`\n- **Tracker API** (httpHeaderAuth, Jira/Linear) -> `Create Incident Ticket`\n- **SendGrid API** (httpHeaderAuth) -> `Send Daily Digest Email`\n\nEnvironment variables:\n- `CERT_API_URL`\n- `WHOIS_API_URL`\n- `TRACKER_API_URL`\n- `TRACKER_PROJECT_ID`\n- `SLACK_WEBHOOK_URL`\n- `DIGEST_FROM_EMAIL`\n- `DIGEST_TO_EMAIL`",
+        "height": 360,
+        "width": 420
+      },
+      "id": "node-0003",
+      "name": "Sticky Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [360, -120]
+    },
+    {
+      "parameters": {
+        "content": "## Gotchas\n\n- The watchlist in `Load Domains` is hardcoded for the demo. In production point it at a database, Google Sheet, or `domains.json` in object storage.\n- All external HTTP nodes retry 3x with a 2s backoff. The dedup state lives in workflow static data, which is per-workflow and survives restarts but is wiped if the workflow is duplicated.\n- The static-data day key uses UTC. Adjust if your on-call follows local time.\n- Cert and WHOIS API response shapes vary by provider. `Compute Severity` is defensive and falls back to `ok` with a note when a field is missing.",
+        "height": 360,
+        "width": 420
+      },
+      "id": "node-0004",
+      "name": "Sticky Gotchas",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [820, -120]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * *"
+            }
+          ]
+        }
+      },
+      "id": "node-0005",
+      "name": "Daily 08:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-560, 320]
+    },
+    {
+      "parameters": {
+        "language": "jsCode",
+        "jsCode": "// Watchlist of domains to monitor.\n// PRODUCTION: replace this static array with a read from a DB,\n// Google Sheet, or a domains.json object in storage.\nconst domains = [\n  'example.com',\n  'api.example.com',\n  'shop.example.com',\n  'mail.example.com'\n];\n\nreturn domains.map((d) => ({ json: { domain: d } }));"
+      },
+      "id": "node-0006",
+      "name": "Load Domains",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-300, 320]
+    },
+    {
+      "parameters": {
+        "options": {
+          "reset": false
+        }
+      },
+      "id": "node-0007",
+      "name": "Loop Over Domains",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [-40, 320]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.CERT_API_URL }}/{{ $json.domain }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "node-0008",
+      "name": "Check TLS Cert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 220],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME_CERT",
+          "name": "Cert API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.WHOIS_API_URL }}",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "domain",
+              "value": "={{ $json.domain }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Accept",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "node-0009",
+      "name": "Check WHOIS",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, 420],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME_WHOIS",
+          "name": "WHOIS API key"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "language": "jsCode",
+        "jsCode": "// WHOIS lookup failed (continueErrorOutput branch).\n// Pass a minimal object so the domain is still scored on cert data.\nconst domain = $json.domain || ($('Check TLS Cert').item ? $('Check TLS Cert').item.json.domain : 'unknown');\nreturn [{ json: { domain, whoisError: true } }];"
+      },
+      "id": "node-0010",
+      "name": "WHOIS Fallback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 540]
+    },
+    {
+      "parameters": {
+        "numberInputs": 2
+      },
+      "id": "node-0011",
+      "name": "Merge Cert + WHOIS",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [760, 320]
+    },
+    {
+      "parameters": {
+        "language": "jsCode",
+        "jsCode": "// Combine the merged cert + whois items for one domain and compute severity.\n// Merge (combine by position) gives two items per domain; fold them.\nfunction daysUntil(value) {\n  if (!value) return null;\n  const t = Date.parse(value);\n  if (Number.isNaN(t)) return null;\n  return Math.floor((t - Date.now()) / 86400000);\n}\n\nfunction band(days) {\n  if (days === null || days === undefined) return 'ok';\n  if (days < 7) return 'critical';\n  if (days < 21) return 'warning';\n  return 'ok';\n}\n\nconst rank = { ok: 0, warning: 1, critical: 2 };\n\n// Reduce all incoming items into a per-domain record.\nconst byDomain = {};\nfor (const item of $input.all()) {\n  const j = item.json || {};\n  const domain = j.domain || (j.host) || 'unknown';\n  byDomain[domain] = Object.assign(byDomain[domain] || { domain }, j);\n}\n\nconst out = [];\nfor (const domain of Object.keys(byDomain)) {\n  const r = byDomain[domain];\n\n  // Defensive field extraction across common cert/whois shapes.\n  const certExpiry = r.valid_till || r.cert_valid_to || r.notAfter || (r.cert && r.cert.valid_to) || null;\n  const regExpiry = r.expiry_date || r.expiration_date || r.registry_expiry || (r.whois && r.whois.expires) || null;\n\n  const certDays = daysUntil(certExpiry);\n  const regDays = daysUntil(regExpiry);\n\n  const certBand = band(certDays);\n  const regBand = r.whoisError ? 'ok' : band(regDays);\n  const severity = rank[certBand] >= rank[regBand] ? certBand : regBand;\n\n  out.push({\n    json: {\n      domain,\n      severity,\n      certDays,\n      regDays,\n      certExpiry,\n      regExpiry,\n      whoisError: !!r.whoisError,\n      note: r.whoisError ? 'WHOIS lookup failed; scored on cert only' : ''\n    }\n  });\n}\n\nreturn out;"
+      },
+      "id": "node-0012",
+      "name": "Compute Severity",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1020, 320]
+    },
+    {
+      "parameters": {},
+      "id": "node-0013",
+      "name": "Collect Findings",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1280, 320]
+    },
+    {
+      "parameters": {
+        "language": "jsCode",
+        "jsCode": "// Idempotency layer. Suppress findings already alerted for the same UTC day.\n// State persists in workflow static data across runs.\nconst staticData = $getWorkflowStaticData('global');\nconst today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)\n\nif (staticData.alertDay !== today) {\n  // New day: reset the dedup ledger.\n  staticData.alertDay = today;\n  staticData.alerted = {};\n}\nstaticData.alerted = staticData.alerted || {};\n\nconst out = [];\nfor (const item of $input.all()) {\n  const f = item.json;\n  const key = `${f.domain}:${f.severity}`;\n\n  // Always pass 'ok' through (used only for counts, never alerts) but mark suppressed.\n  if (f.severity === 'ok') {\n    out.push({ json: Object.assign({}, f, { suppressed: true }) });\n    continue;\n  }\n\n  if (staticData.alerted[key]) {\n    // Already alerted today at this severity: suppress.\n    out.push({ json: Object.assign({}, f, { suppressed: true }) });\n    continue;\n  }\n\n  staticData.alerted[key] = new Date().toISOString();\n  out.push({ json: Object.assign({}, f, { suppressed: false }) });\n}\n\nreturn out;"
+      },
+      "id": "node-0014",
+      "name": "Dedup vs Static Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 320]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.severity }}",
+                    "rightValue": "critical",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "critical"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.severity }}",
+                    "rightValue": "warning",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "warning"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.severity }}",
+                    "rightValue": "ok",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "outputKey": "ok"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-0015",
+      "name": "Switch Severity",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [1800, 320]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.suppressed }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-0016",
+      "name": "Critical Not Suppressed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2060, 120]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.TRACKER_API_URL }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"projectId\": \"{{ $env.TRACKER_PROJECT_ID }}\",\n  \"title\": \"[CRITICAL] {{ $json.domain }} expiring soon\",\n  \"description\": \"Domain {{ $json.domain }} is CRITICAL. Cert days left: {{ $json.certDays }}. Registration days left: {{ $json.regDays }}. {{ $json.note }}\",\n  \"priority\": \"urgent\",\n  \"labels\": [\"ssl-watchdog\", \"critical\"]\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "node-0017",
+      "name": "Create Incident Ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2320, 40],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME_TRACKER",
+          "name": "Tracker API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"text\": \":rotating_light: *CRITICAL* {{ $json.domain }} - cert {{ $json.certDays }}d / registration {{ $json.regDays }}d left. Incident ticket opened.\"\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "node-0018",
+      "name": "Urgent Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2320, 200],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {},
+      "id": "node-0019",
+      "name": "Critical Suppressed NoOp",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2320, 320]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.suppressed }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-0020",
+      "name": "Warning Not Suppressed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [2060, 460]
+    },
+    {
+      "parameters": {},
+      "id": "node-0021",
+      "name": "OK NoOp",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [2060, 640]
+    },
+    {
+      "parameters": {
+        "numberInputs": 2
+      },
+      "id": "node-0022",
+      "name": "Merge Alerts",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [2580, 320]
+    },
+    {
+      "parameters": {
+        "language": "jsCode",
+        "jsCode": "// Build a single digest sorted by severity (critical first).\nconst rank = { critical: 0, warning: 1, ok: 2 };\nconst rows = $input.all()\n  .map((i) => i.json)\n  .filter((f) => f && f.domain)\n  .sort((a, b) => (rank[a.severity] ?? 9) - (rank[b.severity] ?? 9));\n\nif (rows.length === 0) {\n  return [{ json: { skip: true, html: '', text: 'No alertable findings today.' } }];\n}\n\nconst esc = (s) => String(s == null ? '' : s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));\n\nconst trHtml = rows.map((r) =>\n  `<tr><td>${esc(r.domain)}</td><td>${esc(r.severity)}</td><td>${esc(r.certDays)}</td><td>${esc(r.regDays)}</td><td>${esc(r.note)}</td></tr>`\n).join('');\n\nconst html = `<h2>SSL &amp; Domain Watchdog - ${new Date().toISOString().slice(0,10)}</h2>` +\n  `<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\">` +\n  `<tr><th>Domain</th><th>Severity</th><th>Cert days</th><th>Reg days</th><th>Note</th></tr>` +\n  trHtml + `</table>`;\n\nconst lines = rows.map((r) => `• ${r.domain} [${r.severity}] cert ${r.certDays}d / reg ${r.regDays}d`);\nconst text = `SSL & Domain Watchdog digest\\n` + lines.join('\\n');\n\nreturn [{ json: { skip: false, html, text, count: rows.length } }];"
+      },
+      "id": "node-0023",
+      "name": "Build Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2840, 320]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.skip }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "node-0024",
+      "name": "Has Digest?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [3100, 320]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.sendgrid.com/v3/mail/send",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"personalizations\": [{ \"to\": [{ \"email\": \"{{ $env.DIGEST_TO_EMAIL }}\" }] }],\n  \"from\": { \"email\": \"{{ $env.DIGEST_FROM_EMAIL }}\" },\n  \"subject\": \"SSL & Domain Watchdog digest ({{ $json.count }} findings)\",\n  \"content\": [{ \"type\": \"text/html\", \"value\": {{ JSON.stringify($json.html) }} }]\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "node-0025",
+      "name": "Send Daily Digest Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3360, 220],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME_SENDGRID",
+          "name": "SendGrid API"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"text\": {{ JSON.stringify($json.text) }}\n}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "node-0026",
+      "name": "Post Digest to Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [3360, 420],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {},
+      "id": "node-0027",
+      "name": "Nothing To Send",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [3360, 560]
+    }
+  ],
+  "connections": {
+    "Daily 08:00": {
+      "main": [[{ "node": "Load Domains", "type": "main", "index": 0 }]]
+    },
+    "Load Domains": {
+      "main": [[{ "node": "Loop Over Domains", "type": "main", "index": 0 }]]
+    },
+    "Loop Over Domains": {
+      "main": [
+        [{ "node": "Dedup vs Static Data", "type": "main", "index": 0 }],
+        [{ "node": "Check TLS Cert", "type": "main", "index": 0 }]
+      ]
+    },
+    "Check TLS Cert": {
+      "main": [[{ "node": "Check WHOIS", "type": "main", "index": 0 }]]
+    },
+    "Check WHOIS": {
+      "main": [
+        [{ "node": "Merge Cert + WHOIS", "type": "main", "index": 0 }],
+        [{ "node": "WHOIS Fallback", "type": "main", "index": 0 }]
+      ]
+    },
+    "WHOIS Fallback": {
+      "main": [[{ "node": "Merge Cert + WHOIS", "type": "main", "index": 1 }]]
+    },
+    "Merge Cert + WHOIS": {
+      "main": [[{ "node": "Compute Severity", "type": "main", "index": 0 }]]
+    },
+    "Compute Severity": {
+      "main": [[{ "node": "Collect Findings", "type": "main", "index": 0 }]]
+    },
+    "Collect Findings": {
+      "main": [[{ "node": "Loop Over Domains", "type": "main", "index": 0 }]]
+    },
+    "Dedup vs Static Data": {
+      "main": [[{ "node": "Switch Severity", "type": "main", "index": 0 }]]
+    },
+    "Switch Severity": {
+      "main": [
+        [{ "node": "Critical Not Suppressed?", "type": "main", "index": 0 }],
+        [{ "node": "Warning Not Suppressed?", "type": "main", "index": 0 }],
+        [{ "node": "OK NoOp", "type": "main", "index": 0 }]
+      ]
+    },
+    "Critical Not Suppressed?": {
+      "main": [
+        [
+          { "node": "Create Incident Ticket", "type": "main", "index": 0 },
+          { "node": "Urgent Slack Alert", "type": "main", "index": 0 }
+        ],
+        [{ "node": "Critical Suppressed NoOp", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Incident Ticket": {
+      "main": [[{ "node": "Merge Alerts", "type": "main", "index": 0 }]]
+    },
+    "Urgent Slack Alert": {
+      "main": [[{ "node": "Merge Alerts", "type": "main", "index": 0 }]]
+    },
+    "Warning Not Suppressed?": {
+      "main": [
+        [{ "node": "Merge Alerts", "type": "main", "index": 1 }],
+        []
+      ]
+    },
+    "Merge Alerts": {
+      "main": [[{ "node": "Build Digest", "type": "main", "index": 0 }]]
+    },
+    "Build Digest": {
+      "main": [[{ "node": "Has Digest?", "type": "main", "index": 0 }]]
+    },
+    "Has Digest?": {
+      "main": [
+        [
+          { "node": "Send Daily Digest Email", "type": "main", "index": 0 },
+          { "node": "Post Digest to Slack", "type": "main", "index": 0 }
+        ],
+        [{ "node": "Nothing To Send", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "active": false,
+  "settings": { "executionOrder": "v1" },
+  "pinData": {},
+  "meta": { "templateId": null },
+  "tags": []
+}
