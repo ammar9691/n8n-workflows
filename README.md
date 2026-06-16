@@ -1,8 +1,6 @@
 # n8n Workflows
 
-Five [n8n](https://n8n.io) workflows covering DevOps, AI, content, and social automation. Each is an importable JSON export with retries on external calls, conditional routing, deduplication, human approval steps where needed, and sticky-note documentation inside the canvas.
 
-No secrets are committed. API keys, tokens, and service URLs are referenced through n8n credentials or environment variables. Each workflow's README lists what to provide.
 
 ## Workflows
 
