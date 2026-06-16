@@ -1,6 +1,6 @@
 # SSL & Domain Expiry Watchdog (n8n)
 
-A production-grade n8n workflow that runs once a day and watches a list of domains for two separate failure modes: TLS certificate expiry and domain registration (WHOIS) expiry. It scores each domain by severity, opens an incident ticket for anything critical, sends an urgent Slack alert, and finishes by posting a single deduplicated daily digest to email and Slack. Repeat alerts for the same issue on the same day are suppressed using workflow static data, so on-call is not paged every 24 hours for a slow-burning problem.
+Runs once a day and watches a list of domains for two separate failure modes: TLS certificate expiry and domain registration (WHOIS) expiry. It scores each domain by severity, opens an incident ticket for anything critical, sends an urgent Slack alert, and finishes by posting a single deduplicated daily digest to email and Slack. Repeat alerts for the same issue on the same day are suppressed using workflow static data, so on-call is not paged every 24 hours for a slow-burning problem.
 
 ## How it works
 

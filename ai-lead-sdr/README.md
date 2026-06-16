@@ -1,6 +1,6 @@
 # AI Lead Enrichment & Scoring SDR
 
-A production-grade n8n workflow that turns a raw inbound lead into a scored, enriched, and routed sales action in a single webhook call. A new lead arrives by HTTP, the workflow dedupes it, enriches the person and company from external data providers, uses an LLM to score fit and write a personalized opening line, then routes hot, warm, and cold leads to different destinations and writes an audit record.
+Turns an inbound lead into a scored, enriched, and routed sales action in a single webhook call. A lead arrives by HTTP, the workflow dedupes it, enriches the person and company from external data providers, uses an LLM to score fit and write a personalized opening line, then routes hot, warm, and cold leads to different destinations and writes an audit record.
 
 This is built the way you would run it for a real revenue team: idempotent against duplicate submissions, resilient to provider outages, retry-aware on every external call, and observable through an audit log.
 

@@ -1,8 +1,8 @@
 # n8n Workflows
 
-A set of production-grade [n8n](https://n8n.io) automation workflows. These are not starter templates. Each one is built the way a real deployment needs to run: retries on every external call, conditional routing, deduplication and idempotency, human approval gates where money or reputation is on the line, and inline documentation through sticky notes.
+Five [n8n](https://n8n.io) workflows covering DevOps, AI, content, and social automation. Each is an importable JSON export with retries on external calls, conditional routing, deduplication, human approval steps where needed, and sticky-note documentation inside the canvas.
 
-Every workflow is an importable JSON export. No secrets are committed. All API keys, tokens and service URLs are referenced through n8n credentials or environment variables, and each workflow's README lists exactly what to provide.
+No secrets are committed. API keys, tokens, and service URLs are referenced through n8n credentials or environment variables. Each workflow's README lists what to provide.
 
 ## Workflows
 
@@ -16,7 +16,7 @@ Every workflow is an importable JSON export. No secrets are committed. All API k
 
 ## Common engineering patterns
 
-These patterns appear across the set and are what make the workflows production-ready:
+Patterns shared across the set:
 
 - **Retries with backoff** on every node that touches an external API, so a transient failure does not drop the run.
 - **Error-output branching** (`continueErrorOutput`) so one failing dependency degrades gracefully instead of killing the whole flow.

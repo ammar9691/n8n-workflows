@@ -1,6 +1,6 @@
 # Multi-Platform Social Publisher (n8n)
 
-A production-grade n8n workflow that turns a single "blog published" event into approved, platform-tailored posts on Facebook, Instagram, X, and LinkedIn. It uses an LLM to write the copy, enforces each platform's hard limits in code, pauses for one human approval before anything goes live, fans out to each API independently so one failure cannot block the rest, then records every post ID and reports the outcome.
+Turns a single "blog published" event into approved, platform-tailored posts on Facebook, Instagram, X, and LinkedIn. It uses an LLM to write the copy, enforces each platform's hard limits in code, pauses for one human approval before anything goes live, fans out to each API independently so one failure cannot block the rest, then records every post ID and reports the outcome.
 
 ## Summary
 
