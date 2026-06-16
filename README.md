@@ -12,17 +12,6 @@
 | [SEO Blog Content Engine](./seo-blog-engine) | Content / SEO | Pulls queued keywords, researches the SERP, generates an SEO outline then a full draft, runs automated quality checks, and publishes passing drafts to WordPress for human review. Never auto-publishes live. |
 | [Multi-Platform Social Publisher](./social-publisher) | Social | Turns a published blog post into platform-tailored posts for Facebook, Instagram, X and LinkedIn, holds them at a human approval gate, then publishes to each platform and tracks the resulting post ids. |
 
-## Common engineering patterns
-
-Patterns shared across the set:
-
-- **Retries with backoff** on every node that touches an external API, so a transient failure does not drop the run.
-- **Error-output branching** (`continueErrorOutput`) so one failing dependency degrades gracefully instead of killing the whole flow.
-- **Idempotency and deduplication** using workflow static data, so reruns and repeat events do not double-process or spam alerts.
-- **Conditional routing** with IF and Switch nodes instead of one linear path.
-- **Human-in-the-loop gates** where the action is irreversible or public, including a Wait node that resumes on an approval webhook.
-- **Audit logging** of every run for traceability.
-- **No hardcoded secrets**. Credentials and environment variables only.
 
 ## Importing a workflow
 
